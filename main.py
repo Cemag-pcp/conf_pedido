@@ -1,7 +1,7 @@
 import argparse
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
 import pandas as pd
@@ -219,7 +219,7 @@ def _digitar_no_grid(page: Page, valor: str, confirmar_tab: bool = True):
         page.wait_for_timeout(500)
 
 
-def preencher_variaveis(page: Page, data_inicio: str | None = None, data_fim: str | None = None):
+def preencher_variaveis(page: Page, data_inicio: str, data_fim: str | None = None):
     """
     Conforme boas práticas (seção 19):
     - Combos (1, 11, 12): updateCellValue — sem Tab.
@@ -231,7 +231,7 @@ def preencher_variaveis(page: Page, data_inicio: str | None = None, data_fim: st
                6→Fim 7→PrevEmissãoDocInício 8→PrevEmissãoDocFim
                9→ProgEntregaInício 10→ProgEntregaFim
 
-    data_inicio / data_fim: dd/mm/yyyy. Se None, usa hoje-7/hoje.
+    data_inicio / data_fim: dd/mm/yyyy. Se data_fim for None, usa o atalho 'h' (hoje).
     """
     _log("Preenchendo variáveis do relatório")
 
@@ -272,9 +272,8 @@ def preencher_variaveis(page: Page, data_inicio: str | None = None, data_fim: st
     page.wait_for_timeout(500)
 
     # Campo 5: Início (date)
-    dt_inicio = data_inicio or (datetime.now() - timedelta(days=7)).strftime("%d/%m/%Y")
-    _log(f"Data início: {dt_inicio}")
-    fr.press_sequentially(dt_inicio, delay=60)
+    _log(f"Data início: {data_inicio}")
+    fr.press_sequentially(data_inicio, delay=60)
     fr.press("Tab")
     page.wait_for_timeout(500)
 
@@ -547,6 +546,11 @@ _DATE_COLS    = {"PED_EMISSAO", "PED_PREVISAOEMISSAODOC", "PED_PROGRAMACA"}
 _NUMERIC_COLS = {"PED_QUANTIDADE", "PED_UNITARIO", "PED_TOTAL"}
 _CONFLICT_KEY = ("PED_CHCRIACAO", "PED_NUMEROSERIE")
 
+_TABELA_PENDENCIA  = "apontamento_v2.comercial_pendencia_importacao_planilha"
+# Pedido conferido = existe registro aqui com chave_pedido = PED_CHCRIACAO.
+# Pedidos conferidos não podem mais ser alterados pela automação.
+_TABELA_CONFERENCIA = "apontamento_v2.comercial_conferenciapedido"
+
 # Mapeamento: label do relatório → nome interno da coluna no banco.
 # Os cabeçalhos do relatório são rótulos de exibição, não os nomes internos.
 _LABEL_TO_DB: dict[str, str] = {
@@ -679,10 +683,16 @@ def _garantir_constraint(cur):
     """)
 
 
-def upsert_pendencias(df: pd.DataFrame):
+def upsert_pendencias(df: pd.DataFrame, data_inicio: date, data_fim: date):
     """
-    Faz upsert do DataFrame na tabela
+    Sincroniza o DataFrame com a tabela
     apontamento_v2.comercial_pendencia_importacao_planilha.
+
+    Em uma única transação:
+      1. Apaga os pedidos PENDENTES (ainda não conferidos) com emissão entre
+         data_inicio e data_fim — o relatório é a fonte da verdade para essa janela.
+      2. Insere o que veio do relatório, ignorando pedidos já conferidos.
+    Pedidos conferidos nunca são apagados nem alterados.
 
     Chave de conflito: (PED_CHCRIACAO, PED_NUMEROSERIE).
     Colunas do DF são mapeadas para o banco por nome exato (ou case-insensitive).
@@ -731,7 +741,7 @@ def upsert_pendencias(df: pd.DataFrame):
         update_set = ", ".join(update_set_parts)
 
         sql = f"""
-            INSERT INTO apontamento_v2.comercial_pendencia_importacao_planilha
+            INSERT INTO {_TABELA_PENDENCIA}
               ({", ".join(quoted_cols)})
             VALUES %s
             ON CONFLICT ({conflict_sql}) DO UPDATE SET
@@ -753,9 +763,36 @@ def upsert_pendencias(df: pd.DataFrame):
             for _, row in df.iterrows()
         ]
 
-        execute_values(cur, sql, rows)
+        # Pedidos já conferidos ficam congelados: não entram no insert/update
+        cur.execute(f"SELECT DISTINCT chave_pedido FROM {_TABELA_CONFERENCIA}")
+        conferidos = {r[0] for r in cur.fetchall()}
+        idx_ch = mapped_db.index("PED_CHCRIACAO") if "PED_CHCRIACAO" in mapped_db else None
+        if idx_ch is None:
+            raise RuntimeError("Coluna PED_CHCRIACAO não encontrada no relatório; sincronização abortada.")
+        ignorados = [r for r in rows if r[idx_ch] in conferidos]
+        rows = [r for r in rows if r[idx_ch] not in conferidos]
+        if ignorados:
+            _log(f"{len(ignorados)} linha(s) de pedidos já conferidos ignoradas.")
+
+        # Apagar pendentes da janela para substituí-los pelo conteúdo atual do relatório
+        cur.execute(
+            f"""
+            DELETE FROM {_TABELA_PENDENCIA} p
+            WHERE p."PED_EMISSAO" BETWEEN %s AND %s
+              AND NOT EXISTS (
+                  SELECT 1 FROM {_TABELA_CONFERENCIA} c
+                  WHERE c.chave_pedido = p."PED_CHCRIACAO"
+              )
+            """,
+            (data_inicio, data_fim),
+        )
+        _log(f"{cur.rowcount} registro(s) pendente(s) apagado(s) entre "
+             f"{data_inicio:%d/%m/%Y} e {data_fim:%d/%m/%Y}.")
+
+        if rows:
+            execute_values(cur, sql, rows)
         conn.commit()
-        _log(f"Upsert concluído: {len(rows)} registro(s) sincronizado(s).")
+        _log(f"Sincronização concluída: {len(rows)} registro(s) gravado(s).")
 
     except Exception as exc:
         conn.rollback()
@@ -794,6 +831,11 @@ def _parse_args():
 def main():
     args = _parse_args()
 
+    # Janela de emissão: a mesma usada no filtro do relatório e na limpeza dos pendentes
+    data_inicio = args.data_inicio or (datetime.now() - timedelta(days=7)).strftime("%d/%m/%Y")
+    dt_ini = datetime.strptime(data_inicio, "%d/%m/%Y").date()
+    dt_fim = datetime.strptime(args.data_fim, "%d/%m/%Y").date() if args.data_fim else date.today()
+
     _log("Iniciando automação — Conferência de Pedido")
     _log(f"ERP: {ERP_URL} | Usuário: {USERNAME} | Headless: {HEADLESS}")
 
@@ -809,7 +851,7 @@ def main():
         try:
             login(page)
             navegar_relatorio_pendencia(page)
-            preencher_variaveis(page, data_inicio=args.data_inicio, data_fim=args.data_fim)
+            preencher_variaveis(page, data_inicio=data_inicio, data_fim=args.data_fim)
 
             _log("Clicando em Visualizar")
             btn_vis = page.locator("button").filter(has_text="Visualizar").first
@@ -818,7 +860,7 @@ def main():
 
             df = ler_dados_relatorio(page)
             imprimir_relatorio(df)
-            upsert_pendencias(df)
+            upsert_pendencias(df, dt_ini, dt_fim)
 
             _log("Concluído.")
 
