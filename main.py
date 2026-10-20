@@ -1,6 +1,7 @@
+import argparse
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
 import pandas as pd
@@ -218,7 +219,7 @@ def _digitar_no_grid(page: Page, valor: str, confirmar_tab: bool = True):
         page.wait_for_timeout(500)
 
 
-def preencher_variaveis(page: Page):
+def preencher_variaveis(page: Page, data_inicio: str | None = None, data_fim: str | None = None):
     """
     Conforme boas práticas (seção 19):
     - Combos (1, 11, 12): updateCellValue — sem Tab.
@@ -229,6 +230,8 @@ def preencher_variaveis(page: Page):
     Tab order: 2→Classificação 3→ClasseRecurso 4→Recurso 5→Início
                6→Fim 7→PrevEmissãoDocInício 8→PrevEmissãoDocFim
                9→ProgEntregaInício 10→ProgEntregaFim
+
+    data_inicio / data_fim: dd/mm/yyyy. Se None, usa hoje-7/hoje.
     """
     _log("Preenchendo variáveis do relatório")
 
@@ -268,16 +271,21 @@ def preencher_variaveis(page: Page):
     fr.press("Tab")
     page.wait_for_timeout(500)
 
-    # Campo 5: Início (date) — sempre ontem
-    from datetime import timedelta
-    ontem = (datetime.now() - timedelta(days=1)).strftime("%d/%m/%Y")
-    hoje = datetime.now().strftime("%d/%m/%Y")
-    fr.press_sequentially(ontem, delay=60)
+    # Campo 5: Início (date)
+    dt_inicio = data_inicio or (datetime.now() - timedelta(days=7)).strftime("%d/%m/%Y")
+    _log(f"Data início: {dt_inicio}")
+    fr.press_sequentially(dt_inicio, delay=60)
     fr.press("Tab")
     page.wait_for_timeout(500)
 
-    # Campo 6: Fim (date) — sempre hoje
-    fr.press_sequentially('h', delay=60)
+    # Campo 6: Fim (date) — 'h' é o atalho do ERP para hoje; se vier data explícita, digita por extenso
+    dt_fim = data_fim
+    if dt_fim:
+        _log(f"Data fim: {dt_fim}")
+        fr.press_sequentially(dt_fim, delay=60)
+    else:
+        _log("Data fim: hoje (atalho 'h')")
+        fr.press_sequentially("h", delay=60)
     fr.press("Tab")
     page.wait_for_timeout(500)
 
@@ -759,7 +767,33 @@ def upsert_pendencias(df: pd.DataFrame):
 # ---------------------------------------------------------------------------
 # Ponto de entrada
 # ---------------------------------------------------------------------------
+def _parse_args():
+    parser = argparse.ArgumentParser(description="Automação — Conferência de Pedido")
+    parser.add_argument(
+        "--data_inicio",
+        metavar="DD/MM/YYYY",
+        help="Data de início do relatório (padrão: hoje - 7 dias)",
+    )
+    parser.add_argument(
+        "--data_fim",
+        metavar="DD/MM/YYYY",
+        help="Data de fim do relatório (padrão: hoje)",
+    )
+    args = parser.parse_args()
+
+    for campo, valor in [("--data_inicio", args.data_inicio), ("--data_fim", args.data_fim)]:
+        if valor:
+            try:
+                datetime.strptime(valor, "%d/%m/%Y")
+            except ValueError:
+                parser.error(f"{campo}: formato inválido '{valor}'. Use DD/MM/YYYY.")
+
+    return args
+
+
 def main():
+    args = _parse_args()
+
     _log("Iniciando automação — Conferência de Pedido")
     _log(f"ERP: {ERP_URL} | Usuário: {USERNAME} | Headless: {HEADLESS}")
 
@@ -775,7 +809,7 @@ def main():
         try:
             login(page)
             navegar_relatorio_pendencia(page)
-            preencher_variaveis(page)
+            preencher_variaveis(page, data_inicio=args.data_inicio, data_fim=args.data_fim)
 
             _log("Clicando em Visualizar")
             btn_vis = page.locator("button").filter(has_text="Visualizar").first
