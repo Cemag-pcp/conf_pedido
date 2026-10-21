@@ -809,7 +809,7 @@ def _parse_args():
     parser.add_argument(
         "--data_inicio",
         metavar="DD/MM/YYYY",
-        help="Data de início do relatório (padrão: hoje - 7 dias)",
+        help="Data de início do relatório (padrão: hoje - 30 dias)",
     )
     parser.add_argument(
         "--data_fim",
@@ -832,7 +832,7 @@ def main():
     args = _parse_args()
 
     # Janela de emissão: a mesma usada no filtro do relatório e na limpeza dos pendentes
-    data_inicio = args.data_inicio or (datetime.now() - timedelta(days=7)).strftime("%d/%m/%Y")
+    data_inicio = args.data_inicio or (datetime.now() - timedelta(days=30)).strftime("%d/%m/%Y")
     dt_ini = datetime.strptime(data_inicio, "%d/%m/%Y").date()
     dt_fim = datetime.strptime(args.data_fim, "%d/%m/%Y").date() if args.data_fim else date.today()
 
